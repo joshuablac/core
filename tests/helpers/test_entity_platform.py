@@ -8,11 +8,18 @@ import types
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
+from freezegun.api import FrozenDateTimeFactory
 import probatio
 import pytest
 from syrupy.assertion import SnapshotAssertion
 
-from homeassistant.config_entries import ConfigEntry, ConfigSubentryData
+from homeassistant import config_entries
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigEntryDisabler,
+    ConfigEntryState,
+    ConfigSubentryData,
+)
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, PERCENTAGE, EntityCategory
 from homeassistant.core import (
     CoreState,
@@ -40,18 +47,22 @@ from homeassistant.helpers.entity_component import (
 from homeassistant.helpers.entity_platform import (
     AddConfigEntryEntitiesCallback,
     AddEntitiesCallback,
+    async_get_platforms,
 )
 from homeassistant.helpers.service import async_get_all_descriptions
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
 from tests.common import (
     MockConfigEntry,
     MockEntity,
     MockEntityPlatform,
+    MockModule,
     MockPlatform,
     RegistryEntryWithDefaults,
     async_fire_time_changed,
+    mock_integration,
     mock_platform,
     mock_registry,
 )
@@ -1313,6 +1324,156 @@ async def test_stop_shutdown_cancels_retry_setup_and_interval_listener(
     assert len(mock_call_later.return_value.mock_calls) == 1
     assert ent_platform._async_polling_timer is None
     assert ent_platform._async_cancel_retry_setup is None
+
+
+class _RetryTestConfigFlow(config_entries.ConfigFlow):
+    """Minimal config flow so a "test" domain MockConfigEntry can be set up."""
+
+    VERSION = 1
+
+
+async def _async_setup_platform_with_slow_retry(
+    hass: HomeAssistant,
+) -> tuple[MockConfigEntry, asyncio.Event]:
+    """Set up a "test" entry forwarding to "switch".
+
+    The forwarded platform raises PlatformNotReady on the first attempt; the
+    retry blocks on `release` (e.g. a slow device request) before adding an
+    entity, so a test can unload/reload/disable the entry while the retry is
+    in flight.
+    """
+    release = asyncio.Event()
+    calls = 0
+
+    async def setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        await hass.config_entries.async_forward_entry_setups(entry, ["switch"])
+        return True
+
+    async def unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        return await hass.config_entries.async_unload_platforms(entry, ["switch"])
+
+    async def platform_setup_entry(
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        async_add_entities: AddConfigEntryEntitiesCallback,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PlatformNotReady("device offline")
+        await release.wait()
+        async_add_entities([MockEntity(unique_id="u1", name="Dev")])
+
+    mock_integration(
+        hass,
+        MockModule(
+            "test", async_setup_entry=setup_entry, async_unload_entry=unload_entry
+        ),
+    )
+    mock_platform(
+        hass, "test.switch", MockPlatform(async_setup_entry=platform_setup_entry)
+    )
+    mock_platform(hass, "test.config_flow", None)
+    assert await async_setup_component(hass, "switch", {})
+    entry = MockConfigEntry(domain="test", entry_id="e1")
+    entry.add_to_hass(hass)
+    return entry, release
+
+
+async def test_unload_while_retry_in_flight_does_not_add_entities(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A platform destroyed by unload while its retry is in flight must not add
+    entities once that retry finally completes.
+
+    Regression test for a platform-level PlatformNotReady retry that is still
+    awaiting slow I/O when the config entry is unloaded: async_unload_entry
+    calls platform.async_destroy() on the still-running platform. Nothing must
+    add entities to it after that, or the entities and their poll timer would
+    outlive the entry forever.
+    """
+    with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
+        entry, release = await _async_setup_platform_with_slow_retry(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.state is ConfigEntryState.LOADED
+        assert hass.states.async_entity_ids("switch") == []
+
+        # The retry fires (30 s) and blocks inside platform.async_setup_entry.
+        freezer.tick(timedelta(seconds=31))
+        async_fire_time_changed(hass)
+        await asyncio.sleep(0)
+
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert async_get_platforms(hass, "test") == []
+
+        # The device finally answers.
+        release.set()
+        await hass.async_block_till_done()
+
+        assert hass.states.async_entity_ids("switch") == []
+
+
+async def test_reload_while_retry_in_flight_keeps_live_platform(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A reload while the old platform's retry is in flight must not let the
+    orphaned retry win the entity back from the freshly set up platform."""
+    with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
+        entry, release = await _async_setup_platform_with_slow_retry(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        freezer.tick(timedelta(seconds=31))
+        async_fire_time_changed(hass)
+        await asyncio.sleep(0)
+
+        # The old platform's retry and the reload's fresh setup both block on
+        # the same slow "device".
+        reload_task = hass.async_create_task(
+            hass.config_entries.async_reload(entry.entry_id)
+        )
+        await asyncio.sleep(0)
+        release.set()
+        await reload_task
+        await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.LOADED
+        live = async_get_platforms(hass, "test")
+        assert len(live) == 1
+        assert "switch.dev" in live[0].entities
+        assert hass.states.async_entity_ids("switch") == ["switch.dev"]
+
+
+async def test_disable_while_retry_in_flight_does_not_add_entities(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """Disabling the entry while its platform retry is in flight must not add
+    entities once that retry finally completes."""
+    with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
+        entry, release = await _async_setup_platform_with_slow_retry(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        freezer.tick(timedelta(seconds=31))
+        async_fire_time_changed(hass)
+        await asyncio.sleep(0)
+
+        disable_task = hass.async_create_task(
+            hass.config_entries.async_set_disabled_by(
+                entry.entry_id, ConfigEntryDisabler.USER
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        assert await disable_task
+        await hass.async_block_till_done()
+
+        assert entry.disabled_by is ConfigEntryDisabler.USER
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert async_get_platforms(hass, "test") == []
+        assert hass.states.async_entity_ids("switch") == []
 
 
 async def test_not_fails_with_adding_empty_entities_(hass: HomeAssistant) -> None:

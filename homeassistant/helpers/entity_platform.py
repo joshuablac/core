@@ -291,6 +291,13 @@ class EntityPlatform:
         self._async_polling_timer: asyncio.TimerHandle | None = None
         # Method to cancel the retry of setup
         self._async_cancel_retry_setup: CALLBACK_TYPE | None = None
+        # Set by async_destroy(); a PlatformNotReady retry (or a
+        # SLOW_SETUP_MAX_WAIT setup) that was already running when the platform
+        # was destroyed can still finish afterwards. Once True, it must not add
+        # entities or re-arm another retry. Not set by async_reset(), which
+        # helpers/reload.py reuses on the same platform object before calling
+        # async_setup() again.
+        self._destroyed = False
         self._process_updates: asyncio.Lock | None = None
 
         self.parallel_updates: asyncio.Semaphore | None = None
@@ -474,6 +481,11 @@ class EntityPlatform:
 
         async_create_setup_awaitable creates an awaitable that sets up platform.
         """
+        if self._destroyed:
+            # A retry that was armed before the platform was destroyed; nothing
+            # should run on it any more.
+            return False
+
         current_platform.set(self)
         logger = self.logger
         hass = self.hass
@@ -506,6 +518,12 @@ class EntityPlatform:
                 self._tasks.clear()
                 await asyncio.gather(*pending)
         except PlatformNotReady as ex:
+            if self._destroyed:
+                # The platform was destroyed (unload/reload/disable) while this
+                # attempt was in flight; drop it instead of arming a retry that
+                # would run on a platform nothing references any more.
+                return False
+
             tries += 1
             wait_time = min(tries, 6) * PLATFORM_NOT_READY_BASE_WAIT_TIME
             message = str(ex)
@@ -754,6 +772,15 @@ class EntityPlatform:
 
         :param config_subentry_id: subentry which the entities should be added to
         """
+        if self._destroyed:
+            # A PlatformNotReady retry (or a SLOW_SETUP_MAX_WAIT setup) that was
+            # still in flight when this platform was destroyed finished after
+            # the fact; abort instead of adding entities nothing will ever
+            # unload.
+            for entity in new_entities:
+                entity.add_to_platform_abort()
+            return
+
         if config_subentry_id and (
             not self.config_entry
             or config_subentry_id not in self.config_entry.subentries
@@ -1230,6 +1257,7 @@ class EntityPlatform:
 
         Call before discarding the object.
         """
+        self._destroyed = True
         await self.async_reset()
         self.hass.data[DATA_ENTITY_PLATFORM][self.platform_name].remove(self)
 
