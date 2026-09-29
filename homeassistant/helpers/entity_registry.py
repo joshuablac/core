@@ -2043,10 +2043,17 @@ class EntityRegistry(BaseRegistry):
 
         new = attr.evolve(old, **new_values)
 
-        # Only user edits are rejected, integration updates surface as a repair issue
+        # Only reject an update that newly creates the "area of its own without a
+        # name of its own" state. An entry that was already in that state (for
+        # example the device-rename cascade in async_device_modified, which just
+        # carries the entity's name forward, or a registry stored before this
+        # check existed) is left alone; it keeps being reported through the
+        # entity_own_area_without_own_name repair issue instead.
         if (
-            "area_id" in new_values or "name" in new_values
-        ) and _has_own_area_without_own_name(self.hass, new):
+            ("area_id" in new_values or "name" in new_values)
+            and _has_own_area_without_own_name(self.hass, new)
+            and not _has_own_area_without_own_name(self.hass, old)
+        ):
             raise ValueError(
                 "An entity without a name of its own cannot have an area of its own, "
                 "set the area on its device instead"

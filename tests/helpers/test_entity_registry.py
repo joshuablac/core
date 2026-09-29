@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta
 from functools import partial
+import logging
 from typing import Any
 from unittest.mock import patch
 
@@ -2892,6 +2893,44 @@ async def test_update_entity_own_area_without_own_name(
     assert entry.area_id == "kitchen"
 
 
+async def test_update_entity_rejected_area_with_rename_keeps_entity(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """A rejected area update must not drop the entity, even combined with a rename.
+
+    The entity settings dialog can send `area_id` and `new_entity_id` in the same
+    update. `self.entities.pop(old.entity_id)` must run after the "no name of its
+    own" check is raised, not before it, or a rejected update would silently
+    delete the entity from the in-memory registry.
+    """
+    config_entry = MockConfigEntry(domain="light")
+    config_entry.add_to_hass(hass)
+    device_entry = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, "12:34:56:AB:CD:EF")},
+        name="Device",
+    )
+    entry = entity_registry.async_get_or_create(
+        "light",
+        "hue",
+        "1234",
+        config_entry=config_entry,
+        device_id=device_entry.id,
+        has_entity_name=True,
+    )
+    with pytest.raises(ValueError, match="without a name of its own"):
+        entity_registry.async_update_entity(
+            entry.entity_id, area_id="kitchen", new_entity_id="light.renamed"
+        )
+    assert entity_registry.async_get(entry.entity_id) is not None
+    assert entity_registry.async_get("light.renamed") is None
+    assert (
+        entity_registry.async_get_entity_id("light", "hue", "1234") == entry.entity_id
+    )
+
+
 async def test_entity_own_area_without_own_name_issue(
     hass: HomeAssistant,
     device_registry: dr.DeviceRegistry,
@@ -3021,6 +3060,82 @@ async def test_entity_own_area_without_own_name_issue_on_start(
     await hass.async_block_till_done()
 
     assert issue_registry.async_get_issue("homeassistant", issue_id) is not None
+
+
+async def test_device_rename_with_nameless_main_entity_own_area(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Renaming a device must not fail because its main entity has its own area.
+
+    Regression test for the device-rename cascade in async_device_modified: a
+    legacy (has_entity_name=False) main entity whose original_name equals the
+    device name has no name of its own, and it can already have an area of its
+    own from before the integration last renamed it to match the device. That
+    is exactly the state the entity_own_area_without_own_name repair issue
+    reports, so the "no name of its own" check added for direct entity edits
+    must not reject this cascade. Sibling renames and a same-update disable
+    must still apply.
+    """
+    config_entry = MockConfigEntry(domain="light")
+    config_entry.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, "12:34:56:AB:CD:EF")},
+        name="Kitchen Lamp",
+    )
+    # The main entity once had a name of its own, so the user could give it an
+    # area of its own...
+    main = entity_registry.async_get_or_create(
+        "light",
+        "hue",
+        "main",
+        config_entry=config_entry,
+        device_id=device.id,
+        original_name="Lamp",
+    )
+    entity_registry.async_update_entity(main.entity_id, area_id="kitchen")
+    # ...then the integration renamed it to match the device (allowed; only
+    # reported through the repair issue).
+    main = entity_registry.async_get_or_create(
+        "light",
+        "hue",
+        "main",
+        config_entry=config_entry,
+        device_id=device.id,
+        original_name="Kitchen Lamp",
+    )
+    assert main.area_id == "kitchen"
+    assert main.original_name_unprefixed == ""
+    sibling = entity_registry.async_get_or_create(
+        "sensor",
+        "hue",
+        "power",
+        config_entry=config_entry,
+        device_id=device.id,
+        original_name="Kitchen Lamp Power",
+    )
+
+    # The device settings dialog sends a rename and a disable in one update.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR):
+        device_registry.async_update_device(
+            device.id,
+            name_by_user="Big Lamp",
+            disabled_by=dr.DeviceEntryDisabler.USER,
+        )
+        await hass.async_block_till_done()
+
+    assert "Error running job" not in caplog.text
+    main = entity_registry.async_get(main.entity_id)
+    sibling = entity_registry.async_get(sibling.entity_id)
+    assert main.name == "Big Lamp"
+    assert sibling.name == "Big Lamp Power"
+    assert main.disabled_by is er.RegistryEntryDisabler.DEVICE
+    assert sibling.disabled_by is er.RegistryEntryDisabler.DEVICE
+    assert device_registry.async_get(device.id).disabled
 
 
 async def test_update_entity_recalculates_original_name_unprefixed(
