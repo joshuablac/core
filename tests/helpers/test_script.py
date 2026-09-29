@@ -3897,6 +3897,79 @@ async def test_parallel(hass: HomeAssistant, caplog: pytest.LogCaptureFixture) -
     assert_action_trace(expected_trace)
 
 
+async def test_parallel_trace_results_land_on_own_branch(hass: HomeAssistant) -> None:
+    """Test overlapping parallel branches write trace results to their own element.
+
+    Regression test: async_run_with_trace forks trace_path_stack_cv per branch
+    but must also fork trace_stack_cv, the trace element stack. Otherwise every
+    branch task shares the same list, and a result written after an await (like
+    a delay's done=True) lands on whichever branch pushed last, not on the
+    branch that produced it.
+    """
+    sequence = cv.SCRIPT_SCHEMA({"parallel": [{"delay": 1}, {"delay": 2}]})
+    script_obj = script.Script(hass, sequence, "Test Name", "test_domain")
+
+    task = hass.async_create_task(script_obj.async_run(context=Context()))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert script_obj.is_running
+
+    now = dt_util.utcnow()
+    async_fire_time_changed(hass, now + timedelta(seconds=1))
+    await asyncio.sleep(0)
+    async_fire_time_changed(hass, now + timedelta(seconds=2))
+    await task
+
+    assert_action_trace(
+        {
+            "0": [{}],
+            "0/parallel/0/sequence/0": [{"result": {"delay": 1.0, "done": True}}],
+            "0/parallel/1/sequence/0": [{"result": {"delay": 2.0, "done": True}}],
+        }
+    )
+
+
+async def test_parallel_trace_wait_result_not_overwritten_by_sibling(
+    hass: HomeAssistant,
+) -> None:
+    """Test a parallel branch's wait result isn't overwritten by a sibling's delay.
+
+    Branch 0 delays 1 s; branch 1 waits for a template that only becomes true
+    after that. Without a per-branch trace element stack, branch 0's delay
+    __aexit__ pops branch 1's still-open wait element instead of its own.
+    """
+    hass.states.async_set("input_boolean.b", "off")
+    sequence = cv.SCRIPT_SCHEMA(
+        {
+            "parallel": [
+                {"delay": 1},
+                {
+                    "wait_template": "{{ is_state('input_boolean.b', 'on') }}",
+                    "timeout": 10,
+                },
+            ]
+        }
+    )
+    script_obj = script.Script(hass, sequence, "Test Name", "test_domain")
+
+    task = hass.async_create_task(script_obj.async_run(context=Context()))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=1))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    hass.states.async_set("input_boolean.b", "on")
+    await task
+
+    trace_result = trace.trace_get(clear=False)
+    delay_result = trace_result["0/parallel/0/sequence/0"][0].as_dict()["result"]
+    wait_result = trace_result["0/parallel/1/sequence/0"][0].as_dict()["result"]
+    trace.trace_clear()
+
+    assert delay_result == {"delay": 1.0, "done": True}
+    assert "wait" in wait_result
+
+
 async def test_parallel_loop(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
