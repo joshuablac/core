@@ -1383,8 +1383,7 @@ async def _async_setup_platform_with_slow_retry(
 async def test_unload_while_retry_in_flight_does_not_add_entities(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory
 ) -> None:
-    """A platform destroyed by unload while its retry is in flight must not add
-    entities once that retry finally completes.
+    """A destroyed platform must not add entities once its retry completes.
 
     Regression test for a platform-level PlatformNotReady retry that is still
     awaiting slow I/O when the config entry is unloaded: async_unload_entry
@@ -1418,8 +1417,11 @@ async def test_unload_while_retry_in_flight_does_not_add_entities(
 async def test_reload_while_retry_in_flight_keeps_live_platform(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory
 ) -> None:
-    """A reload while the old platform's retry is in flight must not let the
-    orphaned retry win the entity back from the freshly set up platform."""
+    """A reload must not let an orphaned retry win the entity race.
+
+    While the old platform's retry is in flight, it must not win the entity
+    back from the platform the reload just set up.
+    """
     with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
         entry, release = await _async_setup_platform_with_slow_retry(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -1449,8 +1451,11 @@ async def test_reload_while_retry_in_flight_keeps_live_platform(
 async def test_disable_while_retry_in_flight_does_not_add_entities(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory
 ) -> None:
-    """Disabling the entry while its platform retry is in flight must not add
-    entities once that retry finally completes."""
+    """Disabling the entry must not add entities once its retry completes.
+
+    The platform's retry is still in flight when the entry is disabled; it
+    must not win the entity race after the fact.
+    """
     with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
         entry, release = await _async_setup_platform_with_slow_retry(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -1474,6 +1479,167 @@ async def test_disable_while_retry_in_flight_does_not_add_entities(
         assert entry.state is ConfigEntryState.NOT_LOADED
         assert async_get_platforms(hass, "test") == []
         assert hass.states.async_entity_ids("switch") == []
+
+
+class _SlowUpdateEntity(MockEntity):
+    """Entity whose first update blocks on an event (e.g. slow device I/O)."""
+
+    def __init__(self, release: asyncio.Event, **values: Any) -> None:
+        """Store the release event new entities need for should_poll/update."""
+        super().__init__(**values)
+        self._release = release
+
+    @property
+    def should_poll(self) -> bool:
+        return True
+
+    async def async_update(self) -> None:
+        await self._release.wait()
+
+
+async def test_destroy_during_update_before_add_does_not_leak(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A platform destroyed mid-add must not register the entity or its timer.
+
+    update_before_add=True runs the entity's first update (device I/O) before
+    it is registered. If the platform is destroyed while that update is still
+    in flight, _async_add_entity must abort once the update finishes instead
+    of registering the entity and arming its poll timer - the same outcome as
+    when the retry is destroyed before it ever calls async_add_entities.
+    """
+    release = asyncio.Event()
+    calls = 0
+
+    async def setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        await hass.config_entries.async_forward_entry_setups(entry, ["switch"])
+        return True
+
+    async def unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        return await hass.config_entries.async_unload_platforms(entry, ["switch"])
+
+    async def platform_setup_entry(
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        async_add_entities: AddConfigEntryEntitiesCallback,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PlatformNotReady("device offline")
+        async_add_entities(
+            [_SlowUpdateEntity(release, unique_id="u1", name="Dev")], True
+        )
+
+    with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
+        mock_integration(
+            hass,
+            MockModule(
+                "test", async_setup_entry=setup_entry, async_unload_entry=unload_entry
+            ),
+        )
+        mock_platform(
+            hass, "test.switch", MockPlatform(async_setup_entry=platform_setup_entry)
+        )
+        mock_platform(hass, "test.config_flow", None)
+        assert await async_setup_component(hass, "switch", {})
+        entry = MockConfigEntry(domain="test", entry_id="e1")
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        platform = async_get_platforms(hass, "test")[0]
+
+        # The retry fires (30 s) and schedules an add whose update_before_add
+        # blocks in _SlowUpdateEntity.async_update.
+        freezer.tick(timedelta(seconds=31))
+        async_fire_time_changed(hass)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert calls == 2
+
+        unload_task = hass.async_create_task(
+            hass.config_entries.async_unload(entry.entry_id)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # The device finally answers, letting the blocked add resume on a
+        # platform that async_destroy() has already marked destroyed.
+        release.set()
+        assert await unload_task
+        await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert async_get_platforms(hass, "test") == []
+        assert hass.states.async_entity_ids("switch") == []
+        assert list(platform.entities) == []
+        assert platform._async_polling_timer is None
+
+
+async def test_zombie_retry_does_not_rearm_on_destroyed_platform(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> None:
+    """A destroyed platform's retry must not re-arm itself after failing again.
+
+    If the in-flight retry fails again (a second PlatformNotReady) after the
+    platform has been destroyed, _async_setup_platform must not schedule
+    another async_call_later on it - or the retry loop never stops, waking up
+    forever on an object nothing references any more.
+    """
+    release = asyncio.Event()
+    calls = 0
+
+    async def setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        await hass.config_entries.async_forward_entry_setups(entry, ["switch"])
+        return True
+
+    async def unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+        return await hass.config_entries.async_unload_platforms(entry, ["switch"])
+
+    async def platform_setup_entry(
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        async_add_entities: AddConfigEntryEntitiesCallback,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PlatformNotReady("offline")
+        if calls == 2:
+            await release.wait()  # in flight when the entry is unloaded
+            raise PlatformNotReady("still offline")
+        async_add_entities([MockEntity(unique_id="u1", name="Dev")])
+
+    with patch.dict(config_entries.HANDLERS, {"test": _RetryTestConfigFlow}):
+        mock_integration(
+            hass,
+            MockModule(
+                "test", async_setup_entry=setup_entry, async_unload_entry=unload_entry
+            ),
+        )
+        mock_platform(
+            hass, "test.switch", MockPlatform(async_setup_entry=platform_setup_entry)
+        )
+        mock_platform(hass, "test.config_flow", None)
+        assert await async_setup_component(hass, "switch", {})
+        entry = MockConfigEntry(domain="test", entry_id="e1")
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        old = async_get_platforms(hass, "test")[0]
+
+        freezer.tick(timedelta(seconds=31))
+        async_fire_time_changed(hass)
+        await asyncio.sleep(0)
+        assert calls == 2
+
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        release.set()
+        await hass.async_block_till_done()
+
+        assert old._async_cancel_retry_setup is None, (
+            "destroyed platform re-armed its retry (zombie)"
+        )
 
 
 async def test_not_fails_with_adding_empty_entities_(hass: HomeAssistant) -> None:

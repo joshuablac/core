@@ -481,11 +481,6 @@ class EntityPlatform:
 
         async_create_setup_awaitable creates an awaitable that sets up platform.
         """
-        if self._destroyed:
-            # A retry that was armed before the platform was destroyed; nothing
-            # should run on it any more.
-            return False
-
         current_platform.set(self)
         logger = self.logger
         hass = self.hass
@@ -906,6 +901,13 @@ class EntityPlatform:
 
         if restored is None:
             # The entity was rejected and already aborted by the impl.
+            return
+
+        if self._destroyed:
+            # The platform was destroyed (unload/reload/disable) while this
+            # entity's update_before_add (or the add itself) was in flight;
+            # abort instead of registering an entity nothing will ever unload.
+            entity.add_to_platform_abort()
             return
 
         entity_id = entity.entity_id
