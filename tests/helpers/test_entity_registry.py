@@ -3138,6 +3138,80 @@ async def test_device_rename_with_nameless_main_entity_own_area(
     assert device_registry.async_get(device.id).disabled
 
 
+async def _flagged_main_entity(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> er.RegistryEntry:
+    """Return a legacy main entity already flagged by the repair issue.
+
+    Reaches the flagged state the same way the device-rename cascade does: the
+    entity gets an area while it still has a name of its own, then the
+    integration renames it to match the device (allowed; only reported
+    through the entity_own_area_without_own_name repair issue).
+    """
+    config_entry = MockConfigEntry(domain="light")
+    config_entry.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, "12:34:56:AB:CD:EF")},
+        name="Kitchen Lamp",
+    )
+    main = entity_registry.async_get_or_create(
+        "light",
+        "hue",
+        "main",
+        config_entry=config_entry,
+        device_id=device.id,
+        original_name="Lamp",
+    )
+    entity_registry.async_update_entity(main.entity_id, area_id="kitchen")
+    main = entity_registry.async_get_or_create(
+        "light",
+        "hue",
+        "main",
+        config_entry=config_entry,
+        device_id=device.id,
+        original_name="Kitchen Lamp",
+    )
+    assert main.area_id == "kitchen"
+    assert er._has_own_area_without_own_name(hass, main)
+    return main
+
+
+async def test_update_entity_area_change_on_flagged_entity_rejected(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """A user moving an already-flagged entity's area must still be rejected.
+
+    Being already flagged by the entity_own_area_without_own_name repair issue
+    is not a license to move the area around: 7d7b2aebe's rejection of a direct
+    user edit still applies to this entity, even though the device-rename
+    cascade is exempt from it (see
+    test_device_rename_with_nameless_main_entity_own_area above). Only the
+    cascade opts out of the check; a user editing the entity directly does not.
+    """
+    main = await _flagged_main_entity(hass, device_registry, entity_registry)
+    with pytest.raises(ValueError, match="without a name of its own"):
+        entity_registry.async_update_entity(main.entity_id, area_id="bedroom")
+    assert entity_registry.async_get(main.entity_id).area_id == "kitchen"
+
+
+async def test_update_entity_name_equal_device_name_on_flagged_entity_rejected(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Setting a name equal to the device name is still not a name of its own."""
+    main = await _flagged_main_entity(hass, device_registry, entity_registry)
+    with pytest.raises(ValueError, match="without a name of its own"):
+        entity_registry.async_update_entity(
+            main.entity_id, area_id="bedroom", name="Kitchen Lamp"
+        )
+
+
 async def test_update_entity_recalculates_original_name_unprefixed(
     hass: HomeAssistant,
     entity_registry: er.EntityRegistry,

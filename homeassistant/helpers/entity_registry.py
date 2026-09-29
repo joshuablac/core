@@ -1822,6 +1822,7 @@ class EntityRegistry(BaseRegistry):
                     entity.entity_id,
                     name=name,
                     original_name_unprefixed=original_name_unprefixed,
+                    _reject_own_area_without_name=False,
                 )
 
         # Re-enable disabled entities if the device is no longer disabled
@@ -1917,8 +1918,15 @@ class EntityRegistry(BaseRegistry):
         supported_features: int | UndefinedType = UNDEFINED,
         translation_key: str | UndefinedType | None = UNDEFINED,
         unit_of_measurement: str | UndefinedType | None = UNDEFINED,
+        _reject_own_area_without_name: bool = True,
     ) -> RegistryEntry:
-        """Private facing update properties method."""
+        """Private facing update properties method.
+
+        _reject_own_area_without_name is on for every public caller. Only the
+        device-rename cascade in async_device_modified turns it off: it only
+        ever carries an already-flagged entity's name forward (never sets a
+        new area), so there is nothing new to reject there.
+        """
         old = self.entities[entity_id]
 
         device_id = self._ignore_composite_device_id(old.platform, device_id)
@@ -2043,16 +2051,13 @@ class EntityRegistry(BaseRegistry):
 
         new = attr.evolve(old, **new_values)
 
-        # Only reject an update that newly creates the "area of its own without a
-        # name of its own" state. An entry that was already in that state (for
-        # example the device-rename cascade in async_device_modified, which just
-        # carries the entity's name forward, or a registry stored before this
-        # check existed) is left alone; it keeps being reported through the
-        # entity_own_area_without_own_name repair issue instead.
+        # Only user edits are rejected, integration updates surface as a repair
+        # issue. The device-rename cascade below is neither: it opts out with
+        # _reject_own_area_without_name=False (see the docstring above).
         if (
-            ("area_id" in new_values or "name" in new_values)
+            _reject_own_area_without_name
+            and ("area_id" in new_values or "name" in new_values)
             and _has_own_area_without_own_name(self.hass, new)
-            and not _has_own_area_without_own_name(self.hass, old)
         ):
             raise ValueError(
                 "An entity without a name of its own cannot have an area of its own, "
