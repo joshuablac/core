@@ -108,6 +108,7 @@ from .target import (
 )
 from .template import Template, render_complex
 from .trace import (
+    ACTION_TRACE_NODE_MAX_LEN,
     TraceElement,
     trace_append_element,
     trace_path,
@@ -1200,7 +1201,7 @@ type ConditionCheckerTypeOptional = Callable[
 def condition_trace_append(variables: TemplateVarsType, path: str) -> TraceElement:
     """Append a TraceElement to trace[path]."""
     trace_element = TraceElement(variables, path)
-    trace_append_element(trace_element)
+    trace_append_element(trace_element, ACTION_TRACE_NODE_MAX_LEN)
     return trace_element
 
 

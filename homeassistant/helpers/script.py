@@ -96,6 +96,7 @@ from .event import async_call_later, async_track_template
 from .script_variables import ScriptRunVariables, ScriptVariables
 from .template import Template
 from .trace import (
+    ACTION_TRACE_NODE_MAX_LEN,
     TraceElement,
     async_trace_path,
     script_execution_set,
@@ -150,8 +151,6 @@ _TIMEOUT_MSG = "Timeout reached, abort script."
 
 _SHUTDOWN_MAX_WAIT = 60
 
-
-ACTION_TRACE_NODE_MAX_LEN = 20  # Max length of a trace node for repeated actions
 
 SCRIPT_BREAKPOINT_HIT = SignalType[str, str, str]("script_breakpoint_hit")
 SCRIPT_DEBUG_CONTINUE_STOP: SignalTypeFormat[Literal["continue", "stop"]] = (

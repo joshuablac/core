@@ -12,6 +12,11 @@ from homeassistant.util import dt as dt_util
 
 from .typing import TemplateVarsType
 
+# Max length of a trace node for a path that can repeat, e.g. an action or a
+# condition inside a `repeat` loop. Keeps a long-running loop from growing a
+# stored trace without bound.
+ACTION_TRACE_NODE_MAX_LEN = 20
+
 
 class TraceElement:
     """Container for trace data."""

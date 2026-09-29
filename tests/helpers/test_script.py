@@ -2394,6 +2394,61 @@ async def test_repeat_count(
     )
 
 
+async def test_repeat_while_condition_trace_capped(hass: HomeAssistant) -> None:
+    """Test condition trace nodes inside a repeat loop are capped like action nodes.
+
+    Action nodes inside a loop are capped at ACTION_TRACE_NODE_MAX_LEN per path
+    (script.py's action_trace_append), but condition nodes -- the repeat
+    while/until check, and any if/choose/condition step in the loop body --
+    were appended with no cap, so a long-running loop stored one TraceElement
+    per iteration per condition forever.
+    """
+    count = script.ACTION_TRACE_NODE_MAX_LEN * 2
+    sequence = cv.SCRIPT_SCHEMA(
+        {
+            "repeat": {
+                "while": [
+                    {
+                        "condition": "template",
+                        "value_template": "{{ repeat.index <= " + str(count) + " }}",
+                    }
+                ],
+                "sequence": [
+                    {
+                        "if": [
+                            {"condition": "template", "value_template": "{{ true }}"}
+                        ],
+                        "then": [{"variables": {"x": "{{ repeat.index }}"}}],
+                    }
+                ],
+            }
+        }
+    )
+    script_obj = script.Script(hass, sequence, "Test Name", "test_domain")
+    await script_obj.async_run(context=Context())
+
+    tr = trace.trace_get(clear=False)
+    trace.trace_clear()
+
+    oversized = {
+        path: len(elements)
+        for path, elements in tr.items()
+        if len(elements) > script.ACTION_TRACE_NODE_MAX_LEN
+    }
+    assert not oversized, oversized
+
+    # The last retained condition element (the while check) and the last
+    # retained action element (inside the loop body) belong to the same,
+    # final iteration.
+    assert tr["0/repeat"][-1].as_dict()["changed_variables"]["repeat"]["index"] == (
+        count + 1
+    )
+    assert (
+        tr["0/repeat/sequence/0/then/0"][-1].as_dict()["changed_variables"]["x"]
+        == count
+    )
+
+
 async def test_repeat_count_0(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
